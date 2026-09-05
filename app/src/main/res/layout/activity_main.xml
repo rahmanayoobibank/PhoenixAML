@@ -1,0 +1,9 @@
+<LinearLayout xmlns:android="http://schemas.android.com/apk/res/android" android:layout_width="match_parent" android:layout_height="match_parent" android:orientation="vertical" android:padding="16dp">
+ <TextView android:id="@+id/title" android:layout_width="match_parent" android:layout_height="wrap_content" android:text="ققنوس AML" android:textSize="28sp" android:textStyle="bold" android:gravity="right"/>
+ <TextView android:id="@+id/status" android:layout_width="match_parent" android:layout_height="wrap_content" android:text="پایگاه دانش در حال آماده‌سازی..." android:paddingTop="8dp"/>
+ <EditText android:id="@+id/query" android:layout_width="match_parent" android:layout_height="wrap_content" android:hint="سؤال یا موضوع را وارد کنید" android:singleLine="true" android:inputType="text"/>
+ <Button android:id="@+id/importFile" android:layout_width="match_parent" android:layout_height="wrap_content" android:text="افزودن سند PDF / Word / Excel / TXT"/>
+ <Button android:id="@+id/processQueue" android:layout_width="match_parent" android:layout_height="wrap_content" android:text="پردازش صف و افزودن به دانش"/>
+ <Button android:id="@+id/search" android:layout_width="match_parent" android:layout_height="wrap_content" android:text="جست‌وجوی مستند"/>
+ <ScrollView android:layout_width="match_parent" android:layout_height="0dp" android:layout_weight="1"><TextView android:id="@+id/result" android:layout_width="match_parent" android:layout_height="wrap_content" android:paddingTop="12dp" android:textIsSelectable="true" android:textSize="16sp"/></ScrollView>
+</LinearLayout>
