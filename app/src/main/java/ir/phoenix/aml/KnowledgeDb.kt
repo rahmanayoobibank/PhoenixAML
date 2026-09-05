@@ -48,33 +48,36 @@ class KnowledgeDb(private val context: Context) : AutoCloseable {
     )
 
     fun search(query: String, limit: Int = 8): List<Hit> {
-        if (query.isBlank() || limit <= 0) return emptyList()
-        val tokens = query.trim()
-            .replace('"', ' ')
-            .split(Regex("\\s+"))
-            .map { it.trim() }
-            .filter { it.length > 1 }
-        if (tokens.isEmpty()) return emptyList()
-        val match = tokens.joinToString(" ") { token ->
-            "\"${token.replace('"', ' ')}\"*"
-        }
+        val q = query.trim()
+        if (q.isEmpty()) return emptyList()
+
         synchronized(lock) {
-            val sql = "SELECT c.document_name,c.page,c.article,c.paragraph,c.text " +
-                "FROM chunks_fts f JOIN chunks c ON c.rowid=f.rowid " +
-                "WHERE chunks_fts MATCH ? LIMIT ?"
-            db.rawQuery(sql, arrayOf(match, limit.toString())).use { cur ->
-                return buildList {
-                    while (cur.moveToNext()) add(
-                        Hit(
-                            cur.getString(0),
-                            if (cur.isNull(1)) null else cur.getInt(1),
-                            if (cur.isNull(2)) null else cur.getString(2),
-                            if (cur.isNull(3)) null else cur.getString(3),
-                            cur.getString(4)
+            val like = "%$q%"
+            val sql = "SELECT document_name, page, article, paragraph, text FROM chunks " +
+                "WHERE text LIKE ? OR document_name LIKE ? " +
+                "OR COALESCE(article, '') LIKE ? OR COALESCE(paragraph, '') LIKE ? LIMIT ?"
+
+            return db.rawQuery(
+                sql,
+                arrayOf(like, like, like, like, limit.toString())
+            ).use { cur ->
+                buildList {
+                    while (cur.moveToNext()) {
+                        add(
+                            Hit(
+                                cur.getString(0),
+                                if (cur.isNull(1)) null else cur.getInt(1),
+                                if (cur.isNull(2)) null else cur.getString(2),
+                                if (cur.isNull(3)) null else cur.getString(3),
+                                cur.getString(4)
+                            )
                         )
-                    )
+                    }
                 }
             }
+        }
+    }
+
         }
     }
 
@@ -114,12 +117,8 @@ class KnowledgeDb(private val context: Context) : AutoCloseable {
                         stmt.bindLong(16, if (chunk.needsOcr) 1 else 0)
                         stmt.bindString(17, chunk.text)
                         stmt.bindString(18, chunk.metadataJson)
-                        stmt.executeInsert()
-                    }
-                }
                 // chunks_fts is an external-content FTS5 table. Rebuild from the
                 // authoritative chunks table so the new rows are searchable.
-                db.execSQL("INSERT INTO chunks_fts(chunks_fts) VALUES('rebuild')")
                 db.setTransactionSuccessful()
                 return chunks.size
             } finally {
