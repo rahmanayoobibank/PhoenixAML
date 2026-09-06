@@ -5,25 +5,28 @@ import android.database.sqlite.SQLiteDatabase
 import java.io.File
 import org.json.JSONObject
 
-/**
- * Local knowledge store.
- *
- * The packaged DB is the initial verified bundle. On first run it is copied to
- * app-private storage and then kept writable so successfully processed imports
- * can be added without modifying the APK asset.
- */
 class KnowledgeDb(private val context: Context) : AutoCloseable {
+
     private val lock = Any()
     private val db: SQLiteDatabase
 
     init {
         val target = File(context.filesDir, "phoenix_aml.db")
+
         if (!target.exists()) {
             context.assets.open("phoenix_aml.db").use { input ->
-                target.outputStream().use { output -> input.copyTo(output) }
+                target.outputStream().use { output ->
+                    input.copyTo(output)
+                }
             }
         }
-        db = SQLiteDatabase.openDatabase(target.path, null, SQLiteDatabase.OPEN_READWRITE)
+
+        db = SQLiteDatabase.openDatabase(
+            target.path,
+            null,
+            SQLiteDatabase.OPEN_READWRITE
+        )
+
         db.enableWriteAheadLogging()
         db.execSQL("PRAGMA foreign_keys=ON")
     }
@@ -53,23 +56,36 @@ class KnowledgeDb(private val context: Context) : AutoCloseable {
 
         synchronized(lock) {
             val like = "%$q%"
-            val sql = "SELECT document_name, page, article, paragraph, text FROM chunks " +
-                "WHERE text LIKE ? OR document_name LIKE ? " +
-                "OR COALESCE(article, '') LIKE ? OR COALESCE(paragraph, '') LIKE ? LIMIT ?"
+
+            val sql =
+                "SELECT document_name, page, article, paragraph, text " +
+                "FROM chunks " +
+                "WHERE text LIKE ? " +
+                "OR document_name LIKE ? " +
+                "OR COALESCE(article, '') LIKE ? " +
+                "OR COALESCE(paragraph, '') LIKE ? " +
+                "LIMIT ?"
 
             return db.rawQuery(
                 sql,
-                arrayOf(like, like, like, like, limit.toString())
+                arrayOf(
+                    like,
+                    like,
+                    like,
+                    like,
+                    limit.toString()
+                )
             ).use { cur ->
+
                 buildList {
                     while (cur.moveToNext()) {
                         add(
                             Hit(
-                                cur.getString(0),
-                                if (cur.isNull(1)) null else cur.getInt(1),
-                                if (cur.isNull(2)) null else cur.getString(2),
-                                if (cur.isNull(3)) null else cur.getString(3),
-                                cur.getString(4)
+                                document = cur.getString(0),
+                                page = if (cur.isNull(1)) null else cur.getInt(1),
+                                article = if (cur.isNull(2)) null else cur.getString(2),
+                                paragraph = if (cur.isNull(3)) null else cur.getString(3),
+                                text = cur.getString(4)
                             )
                         )
                     }
@@ -78,32 +94,53 @@ class KnowledgeDb(private val context: Context) : AutoCloseable {
         }
     }
 
+    fun containsSourceHash(sourceHash: String): Boolean =
+        synchronized(lock) {
+            db.rawQuery(
+                "SELECT 1 FROM chunks WHERE source_hash=? LIMIT 1",
+                arrayOf(sourceHash)
+            ).use {
+                it.moveToFirst()
+            }
         }
-    }
-
-    fun containsSourceHash(sourceHash: String): Boolean = synchronized(lock) {
-        db.rawQuery("SELECT 1 FROM chunks WHERE source_hash=? LIMIT 1", arrayOf(sourceHash)).use { it.moveToFirst() }
-    }
 
     fun insertDocument(chunks: List<Chunk>): Int {
         if (chunks.isEmpty()) return 0
+
         synchronized(lock) {
             val uniqueHash = chunks.first().sourceHash
-            if (containsSourceHash(uniqueHash)) return 0
+
+            if (containsSourceHash(uniqueHash)) {
+                return 0
+            }
+
             db.beginTransaction()
+
             try {
-                val sql = "INSERT INTO chunks(" +
-                    "id,document_id,document_name,source_hash,page,article,paragraph,item,chapter,section," +
-                    "version_label,issue_date,effective_date,validity_status,source_priority,needs_ocr,text,metadata_json" +
+                val sql =
+                    "INSERT INTO chunks(" +
+                    "id,document_id,document_name,source_hash,page," +
+                    "article,paragraph,item,chapter,section," +
+                    "version_label,issue_date,effective_date," +
+                    "validity_status,source_priority,needs_ocr,text,metadata_json" +
                     ") VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)"
+
                 db.compileStatement(sql).use { stmt ->
+
                     for (chunk in chunks) {
                         stmt.clearBindings()
+
                         stmt.bindString(1, chunk.id)
                         stmt.bindString(2, chunk.documentId)
                         stmt.bindString(3, chunk.documentName)
                         stmt.bindString(4, chunk.sourceHash)
-                        if (chunk.page == null) stmt.bindNull(5) else stmt.bindLong(5, chunk.page.toLong())
+
+                        if (chunk.page == null) {
+                            stmt.bindNull(5)
+                        } else {
+                            stmt.bindLong(5, chunk.page.toLong())
+                        }
+
                         stmt.bindNull(6)
                         stmt.bindNull(7)
                         stmt.bindNull(8)
@@ -112,30 +149,51 @@ class KnowledgeDb(private val context: Context) : AutoCloseable {
                         stmt.bindNull(11)
                         stmt.bindNull(12)
                         stmt.bindNull(13)
+
                         stmt.bindString(14, "verified_import")
                         stmt.bindLong(15, 0)
                         stmt.bindLong(16, if (chunk.needsOcr) 1 else 0)
+
                         stmt.bindString(17, chunk.text)
                         stmt.bindString(18, chunk.metadataJson)
+
+                        stmt.executeInsert()
+                    }
+                }
+
                 db.setTransactionSuccessful()
                 return chunks.size
+
             } finally {
                 db.endTransaction()
             }
         }
     }
 
-    fun buildMetadata(sourceName: String, sourceHash: String, extension: String, extra: Map<String, Any?> = emptyMap()): String {
+    fun buildMetadata(
+        sourceName: String,
+        sourceHash: String,
+        extension: String,
+        extra: Map<String, Any?> = emptyMap()
+    ): String {
+
         val json = JSONObject()
+
         json.put("source_name", sourceName)
         json.put("source_hash", sourceHash)
         json.put("extension", extension)
         json.put("authoritative", true)
-        extra.forEach { (k, v) -> json.put(k, v) }
+
+        extra.forEach { (key, value) ->
+            json.put(key, value)
+        }
+
         return json.toString()
     }
 
     override fun close() {
-        synchronized(lock) { db.close() }
+        synchronized(lock) {
+            db.close()
+        }
     }
 }
