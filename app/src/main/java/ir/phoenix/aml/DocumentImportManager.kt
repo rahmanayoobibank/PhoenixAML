@@ -12,7 +12,7 @@ class DocumentImportManager(private val context: Context) {
     data class Imported(val id: String, val name: String, val sha256: String, val file: File, val extension: String)
 
     private val inbox = File(context.filesDir, "import_inbox").apply { mkdirs() }
-    private val allowed = setOf("pdf", "docx", "xlsx", "txt")
+    private val allowed = setOf("pdf", "doc", "docx", "xlsx", "txt")
 
     fun import(uri: Uri): Imported {
         val original = displayName(uri)
