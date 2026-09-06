@@ -117,8 +117,6 @@ class KnowledgeDb(private val context: Context) : AutoCloseable {
                         stmt.bindLong(16, if (chunk.needsOcr) 1 else 0)
                         stmt.bindString(17, chunk.text)
                         stmt.bindString(18, chunk.metadataJson)
-                // chunks_fts is an external-content FTS5 table. Rebuild from the
-                // authoritative chunks table so the new rows are searchable.
                 db.setTransactionSuccessful()
                 return chunks.size
             } finally {
