@@ -7,6 +7,9 @@ import com.tom_roush.pdfbox.text.PDFTextStripper
 import org.xmlpull.v1.XmlPullParser
 import android.util.Xml
 import java.io.File
+import java.io.FileInputStream
+import org.apache.poi.hwpf.HWPFDocument
+import org.apache.poi.hwpf.extractor.WordExtractor
 import java.io.StringReader
 import java.security.MessageDigest
 import java.util.UUID
@@ -32,6 +35,7 @@ class DocumentProcessor(private val context: Context, private val db: KnowledgeD
             val chunks = when (ext) {
                 "txt" -> textChunks(file.readText(Charsets.UTF_8), name, hash, documentId, ext)
                 "docx" -> textChunks(extractDocx(file), name, hash, documentId, ext)
+        "doc" -> textChunks(extractDoc(file), name, hash, documentId, ext)
                 "xlsx" -> textChunks(extractXlsx(file), name, hash, documentId, ext)
                 "pdf" -> pdfChunks(file, name, hash, documentId)
                 else -> emptyList()
@@ -94,6 +98,14 @@ class DocumentProcessor(private val context: Context, private val db: KnowledgeD
             }
             if (end >= text.length) break
             start = maxOf(end - overlap, start + 1)
+        }
+    }
+
+    private fun extractDoc(file: File): String = FileInputStream(file).use { input ->
+        HWPFDocument(input).use { document ->
+            WordExtractor(document).use { extractor ->
+                extractor.text ?: ""
+            }
         }
     }
 
@@ -190,11 +202,7 @@ class DocumentProcessor(private val context: Context, private val db: KnowledgeD
         return out.toString()
     }
 
-    private fun normalize(text: String): String = text
-        .replace('\u0000'.toString(), "")
-        .replace(Regex("[ \\t]+"), " ")
-        .replace(Regex("\\n{3,}"), "\n\n")
-        .trim()
+    private fun normalize(text: String): String = PersianTextNormalizer.normalize(text)
 
     private fun sha256(file: File): String {
         val md = MessageDigest.getInstance("SHA-256")
