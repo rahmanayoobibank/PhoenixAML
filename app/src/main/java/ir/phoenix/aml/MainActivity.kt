@@ -79,20 +79,17 @@ class MainActivity : Activity() {
             result.text = "جست‌وجو انجام نشد: ${e.message ?: "خطای ناشناخته"}"
         }
     }
-
-    private fun pickFile() {
-        startActivityForResult(Intent(Intent.ACTION_OPEN_DOCUMENT).apply {
-            type = "*/*"
-            putExtra(Intent.EXTRA_MIME_TYPES, arrayOf(
-                "application/pdf",
-                "application/msword",
-                "application/vnd.openxmlformats-officedocument.wordprocessingml.document",
-                "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
-                "text/plain"
-            ))
-            addCategory(Intent.CATEGORY_OPENABLE)
-        }, pickCode)
-    }
+private fun pickFile() {
+    startActivityForResult(Intent(Intent.ACTION_OPEN_DOCUMENT).apply {
+        type = "*/*"
+        putExtra(Intent.EXTRA_MIME_TYPES, arrayOf(
+            "application/pdf", "application/msword", "application/vnd.openxmlformats-officedocument.wordprocessingml.document",
+            "application/vnd.ms-excel", "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet", "text/plain",
+            "image/jpeg", "image/png", "image/bmp", "image/webp"
+        ))
+        addCategory(Intent.CATEGORY_OPENABLE)
+    }, pickCode)
+}
 
     override fun onActivityResult(requestCode: Int, resultCode: Int, data: Intent?) {
         super.onActivityResult(requestCode, resultCode, data)
