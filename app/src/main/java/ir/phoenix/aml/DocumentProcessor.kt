@@ -1,215 +1,158 @@
 package ir.phoenix.aml
 
 import android.content.Context
+import android.graphics.Bitmap
+import android.graphics.BitmapFactory
+import android.graphics.Rect
+import android.graphics.pdf.PdfRenderer
+import android.os.ParcelFileDescriptor
+import com.googlecode.tesseract.android.TessBaseAPI
 import com.tom_roush.pdfbox.android.PDFBoxResourceLoader
 import com.tom_roush.pdfbox.pdmodel.PDDocument
 import com.tom_roush.pdfbox.text.PDFTextStripper
-import org.xmlpull.v1.XmlPullParser
-import android.util.Xml
 import java.io.File
-import java.io.FileInputStream
-import org.apache.poi.hwpf.HWPFDocument
-import org.apache.poi.hwpf.extractor.WordExtractor
-import java.io.StringReader
-import java.security.MessageDigest
-import java.util.UUID
+import java.io.FileOutputStream
 import java.util.zip.ZipFile
+import javax.xml.parsers.DocumentBuilderFactory
 
-/** Extracts supported office/PDF/text formats and commits only quality-checked text. */
-class DocumentProcessor(private val context: Context, private val db: KnowledgeDb) {
-    data class Outcome(val name: String, val inserted: Int, val message: String, val success: Boolean)
+class DocumentProcessor(private val context: Context) {
+    data class Chunk(val page: Int?, val article: String?, val paragraph: String?, val text: String)
 
-    init { PDFBoxResourceLoader.init(context) }
+    fun process(file: File): List<Chunk> {
+        return when (file.extension.lowercase()) {
+            "pdf" -> processPdf(file)
+            "txt" -> listOf(Chunk(1, null, null, file.readText(Charsets.UTF_8)))
+            "docx" -> listOf(Chunk(null, null, null, extractDocx(file)))
+            "xlsx" -> listOf(Chunk(null, null, null, extractXlsx(file)))
+            "jpg", "jpeg", "png", "bmp", "webp" -> processImage(file)
+            else -> emptyList()
+        }.filter { it.text.isNotBlank() }
+    }
 
-    fun process(file: File): Outcome {
-        val name = file.name.substringAfter('_', file.name)
-        val ext = name.substringAfterLast('.', "").lowercase()
-        val hash = sha256(file)
-        if (db.containsSourceHash(hash)) {
-            file.delete()
-            return Outcome(name, 0, "این فایل قبلاً وارد پایگاه دانش شده است.", true)
+    private fun processImage(file: File): List<Chunk> {
+        val bitmap = BitmapFactory.decodeFile(file.path) ?: return emptyList()
+        val scaled = scaleForOcr(bitmap)
+        val text = runOcr(scaled)
+        if (scaled !== bitmap) bitmap.recycle()
+        if (text.isBlank()) return emptyList()
+        return listOf(Chunk(null, LegalQueryEngine.articleNumberIn(text)?.toString(), null, text))
+    }
+
+    private fun scaleForOcr(bitmap: Bitmap): Bitmap {
+        val targetWidth = 1800
+        if (bitmap.width <= targetWidth) return bitmap
+        val targetHeight = (targetWidth.toFloat() * bitmap.height / bitmap.width).toInt()
+        return Bitmap.createScaledBitmap(bitmap, targetWidth, targetHeight, true)
+    }
+
+    private fun processPdf(file: File): List<Chunk> {
+        PDFBoxResourceLoader.init(context)
+        val chunks = ArrayList<Chunk>()
+        PDDocument.load(file).use { doc ->
+            for (pageNo in 1..doc.numberOfPages) {
+                val stripper = PDFTextStripper().apply {
+                    startPage = pageNo
+                    endPage = pageNo
+                    sortByPosition = true
+                }
+                val text = runCatching { stripper.getText(doc) }.getOrDefault("")
+                if (isUsablePersianText(text)) {
+                    chunks += Chunk(pageNo, LegalQueryEngine.articleNumberIn(text)?.toString(), null, text)
+                } else {
+                    val ocr = ocrPdfPage(file, pageNo)
+                    if (ocr.isNotBlank()) chunks += Chunk(pageNo, LegalQueryEngine.articleNumberIn(ocr)?.toString(), null, ocr)
+                }
+            }
+        }
+        return chunks
+    }
+
+    private fun isUsablePersianText(text: String): Boolean {
+        val n = PersianSearchNormalizer.normalize(text)
+        if (n.length < 25) return false
+        val fa = n.count { it in '\u0600'..'\u06FF' }
+        val letters = n.count { it.isLetter() }
+        return fa >= 8 && letters > 0 && fa.toDouble() / letters.toDouble() > 0.08
+    }
+
+    private fun ocrPdfPage(file: File, pageNumber: Int): String {
+        val pfd = ParcelFileDescriptor.open(file, ParcelFileDescriptor.MODE_READ_ONLY)
+        val renderer = PdfRenderer(pfd)
+        val page = renderer.openPage(pageNumber - 1)
+        val width = 1800
+        val height = (width.toFloat() * page.height / page.width).toInt().coerceAtLeast(900)
+        val bitmap = Bitmap.createBitmap(width, height, Bitmap.Config.ARGB_8888)
+        page.render(bitmap, Rect(0, 0, width, height), null, PdfRenderer.Page.RENDER_MODE_FOR_DISPLAY)
+        page.close()
+        renderer.close()
+        pfd.close()
+
+        val text = runOcr(bitmap)
+        bitmap.recycle()
+        return text
+    }
+
+    private fun runOcr(bitmap: Bitmap): String {
+        val tessRoot = File(context.filesDir, "tesseract").apply { mkdirs() }
+        val tessData = File(tessRoot, "tessdata").apply { mkdirs() }
+        val trained = File(tessData, "fas.traineddata")
+        if (!trained.exists()) context.assets.open("tessdata/fas.traineddata").use { input ->
+            FileOutputStream(trained).use { output -> input.copyTo(output) }
         }
 
+        val tess = TessBaseAPI()
         return try {
-            val documentId = UUID.randomUUID().toString()
-            val chunks = when (ext) {
-                "txt" -> textChunks(file.readText(Charsets.UTF_8), name, hash, documentId, ext)
-                "docx" -> textChunks(extractDocx(file), name, hash, documentId, ext)
-        "doc" -> textChunks(extractDoc(file), name, hash, documentId, ext)
-                "xlsx" -> textChunks(extractXlsx(file), name, hash, documentId, ext)
-                "pdf" -> pdfChunks(file, name, hash, documentId)
-                else -> emptyList()
-            }
-            if (chunks.isEmpty()) {
-                return Outcome(name, 0, "از فایل متن قابل اعتماد استخراج نشد؛ فایل در صف بررسی باقی می‌ماند.", false)
-            }
-            val inserted = db.insertDocument(chunks)
-            file.delete()
-            val id = file.name.substringBefore('_')
-            File(file.parentFile, "$id.meta").delete()
-            Outcome(name, inserted, "پردازش کامل شد؛ $inserted بخش وارد پایگاه دانش شد.", true)
-        } catch (e: Exception) {
-            Outcome(name, 0, "پردازش ناموفق بود: ${e.message ?: "خطای ناشناخته"}", false)
+            if (!tess.init(tessRoot.absolutePath, "fas")) return ""
+            tess.setImage(bitmap)
+            tess.getUTF8Text()?.trim().orEmpty()
+        } finally {
+            tess.recycle()
         }
     }
 
-    private fun pdfChunks(file: File, name: String, hash: String, documentId: String): List<KnowledgeDb.Chunk> {
-        PDDocument.load(file).use { pdf ->
-            val result = mutableListOf<KnowledgeDb.Chunk>()
-            val stripper = PDFTextStripper().apply { sortByPosition = true }
-            for (page in 1..pdf.numberOfPages) {
-                stripper.startPage = page
-                stripper.endPage = page
-                val text = normalize(stripper.getText(pdf))
-                if (text.isNotBlank()) {
-                    addSplitChunks(result, text, name, hash, documentId, "pdf", page)
+    private fun extractDocx(file: File): String {
+        ZipFile(file).use { zip ->
+            val entry = zip.getEntry("word/document.xml") ?: return ""
+            val factory = DocumentBuilderFactory.newInstance().apply { isNamespaceAware = true }
+            val doc = factory.newDocumentBuilder().parse(zip.getInputStream(entry))
+            return doc.getElementsByTagNameNS("*", "t").let { nodes ->
+                buildString {
+                    for (i in 0 until nodes.length) append(nodes.item(i).textContent).append(' ')
                 }
             }
-            if (result.isEmpty()) throw IllegalArgumentException("PDF تصویری/اسکن‌شده است یا متن آن قابل استخراج نیست")
-            return result
         }
     }
 
-    private fun textChunks(text: String, name: String, hash: String, documentId: String, ext: String): List<KnowledgeDb.Chunk> {
-        val normalized = normalize(text)
-        require(normalized.isNotBlank()) { "متن فایل خالی است" }
-        val result = mutableListOf<KnowledgeDb.Chunk>()
-        addSplitChunks(result, normalized, name, hash, documentId, ext, null)
-        return result
-    }
-
-    private fun addSplitChunks(
-        out: MutableList<KnowledgeDb.Chunk>, text: String, name: String, hash: String,
-        documentId: String, ext: String, page: Int?
-    ) {
-        val max = 3500
-        val overlap = 250
-        var start = 0
-        while (start < text.length) {
-            var end = minOf(start + max, text.length)
-            if (end < text.length) {
-                val cut = text.lastIndexOfAny(charArrayOf('\n', '.', '؟', '!', '،', ' '), end - 1)
-                if (cut > start + 1200) end = cut
+    private fun extractXlsx(file: File): String {
+        ZipFile(file).use { zip ->
+            val factory = DocumentBuilderFactory.newInstance().apply { isNamespaceAware = true }
+            val shared = mutableListOf<String>()
+            zip.getEntry("xl/sharedStrings.xml")?.let { entry ->
+                val doc = factory.newDocumentBuilder().parse(zip.getInputStream(entry))
+                val nodes = doc.getElementsByTagNameNS("*", "t")
+                for (i in 0 until nodes.length) shared += nodes.item(i).textContent
             }
-            val part = text.substring(start, end).trim()
-            if (part.length >= 20) {
-                val metadata = db.buildMetadata(name, hash, ext, mapOf("page" to page, "chunk_start" to start, "chunk_end" to end))
-                out += KnowledgeDb.Chunk(UUID.randomUUID().toString(), documentId, name, hash, page, part, metadata)
-            }
-            if (end >= text.length) break
-            start = maxOf(end - overlap, start + 1)
-        }
-    }
-
-    private fun extractDoc(file: File): String = FileInputStream(file).use { input ->
-        HWPFDocument(input).use { document ->
-            WordExtractor(document).use { extractor ->
-                extractor.text ?: ""
-            }
-        }
-    }
-
-    private fun extractDocx(file: File): String = ZipFile(file).use { zip ->
-        val entry = zip.getEntry("word/document.xml") ?: throw IllegalArgumentException("ساختار DOCX نامعتبر است")
-        zip.getInputStream(entry).use { input -> parseWordXml(input.readBytes().toString(Charsets.UTF_8)) }
-    }
-
-    private fun parseWordXml(xml: String): String {
-        val parser = Xml.newPullParser().apply { setInput(StringReader(xml)) }
-        val out = StringBuilder()
-        var event = parser.eventType
-        while (event != XmlPullParser.END_DOCUMENT) {
-            if (event == XmlPullParser.START_TAG) {
-                when (parser.name) {
-                    "t" -> out.append(parser.nextText())
-                    "tab" -> out.append('\t')
-                    "br", "cr" -> out.append('\n')
-                }
-            } else if (event == XmlPullParser.END_TAG && parser.name == "p") {
-                out.append('\n')
-            }
-            event = parser.next()
-        }
-        return out.toString()
-    }
-
-    private fun extractXlsx(file: File): String = ZipFile(file).use { zip ->
-        val shared = zip.getEntry("xl/sharedStrings.xml")?.let { entry ->
-            zip.getInputStream(entry).use { parseSharedStrings(it.readBytes().toString(Charsets.UTF_8)) }
-        } ?: emptyList()
-        val sheets = zip.entries().asSequence()
-            .filter { !it.isDirectory && it.name.matches(Regex("xl/worksheets/sheet\\d+\\.xml")) }
-            .sortedBy { it.name }
-            .toList()
-        require(sheets.isNotEmpty()) { "ساختار XLSX نامعتبر است" }
-        buildString {
-            for (sheet in sheets) {
-                zip.getInputStream(sheet).use { append(parseSheet(it.readBytes().toString(Charsets.UTF_8), shared)); append('\n') }
-            }
-        }
-    }
-
-    private fun parseSharedStrings(xml: String): List<String> {
-        val parser = Xml.newPullParser().apply { setInput(StringReader(xml)) }
-        val out = mutableListOf<String>()
-        var current = StringBuilder()
-        var inSi = false
-        var event = parser.eventType
-        while (event != XmlPullParser.END_DOCUMENT) {
-            if (event == XmlPullParser.START_TAG) {
-                when (parser.name) {
-                    "si" -> { current = StringBuilder(); inSi = true }
-                    "t" -> if (inSi) current.append(parser.nextText())
-                }
-            } else if (event == XmlPullParser.END_TAG && parser.name == "si") {
-                out += current.toString(); inSi = false
-            }
-            event = parser.next()
-        }
-        return out
-    }
-
-    private fun parseSheet(xml: String, shared: List<String>): String {
-        val parser = Xml.newPullParser().apply { setInput(StringReader(xml)) }
-        val out = StringBuilder()
-        var cellType: String? = null
-        var cellRef: String? = null
-        var inV = false
-        var value = StringBuilder()
-        var event = parser.eventType
-        while (event != XmlPullParser.END_DOCUMENT) {
-            if (event == XmlPullParser.START_TAG) {
-                when (parser.name) {
-                    "c" -> { cellType = parser.getAttributeValue(null, "t"); cellRef = parser.getAttributeValue(null, "r") }
-                    "v", "t" -> if (cellType != "inlineStr" || parser.name == "t") { inV = true; value = StringBuilder() }
-                }
-            } else if (event == XmlPullParser.TEXT && inV) {
-                value.append(parser.text)
-            } else if (event == XmlPullParser.END_TAG) {
-                when (parser.name) {
-                    "v", "t" -> if (inV) { inV = false }
-                    "c" -> {
-                        val raw = value.toString()
-                        val finalValue = if (cellType == "s") shared.getOrNull(raw.toIntOrNull() ?: -1) ?: raw else raw
-                        if (finalValue.isNotBlank()) out.append(cellRef ?: "").append('=').append(finalValue).append("\t")
-                        value = StringBuilder(); cellType = null; cellRef = null
+            val sheets = zip.entries().asSequence().filter { it.name.matches(Regex("xl/worksheets/sheet\\d+\\.xml")) }.toList()
+            return buildString {
+                for (sheet in sheets) {
+                    val doc = factory.newDocumentBuilder().parse(zip.getInputStream(sheet))
+                    val cells = doc.getElementsByTagNameNS("*", "c")
+                    for (i in 0 until cells.length) {
+                        val cell = cells.item(i)
+                        val type = cell.attributes?.getNamedItem("t")?.nodeValue
+                        val values = cell.childNodes
+                        var value = ""
+                        for (j in 0 until values.length) {
+                            val n = values.item(j)
+                            if (n.localName == "v") value = n.textContent
+                            if (n.localName == "t") value = n.textContent
+                        }
+                        if (type == "s") value = value.toIntOrNull()?.let { shared.getOrNull(it).orEmpty() } ?: value
+                        if (value.isNotBlank()) append(value).append(' ')
                     }
-                    "row" -> out.append('\n')
+                    append('\n')
                 }
             }
-            event = parser.next()
         }
-        return out.toString()
-    }
-
-    private fun normalize(text: String): String = PersianTextNormalizer.normalize(text)
-
-    private fun sha256(file: File): String {
-        val md = MessageDigest.getInstance("SHA-256")
-        file.inputStream().use { input ->
-            val buf = ByteArray(8192)
-            while (true) { val n = input.read(buf); if (n <= 0) break; md.update(buf, 0, n) }
-        }
-        return md.digest().joinToString("") { "%02x".format(it) }
     }
 }
