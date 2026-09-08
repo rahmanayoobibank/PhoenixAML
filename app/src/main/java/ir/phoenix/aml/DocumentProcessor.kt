@@ -15,27 +15,39 @@ import java.io.FileOutputStream
 import java.util.zip.ZipFile
 import javax.xml.parsers.DocumentBuilderFactory
 
-class DocumentProcessor(private val context: Context) {
-    data class Chunk(val page: Int?, val article: String?, val paragraph: String?, val text: String)
+class DocumentProcessor(private val context: Context, private val db: KnowledgeDb) {
+    data class Outcome(val success: Boolean, val message: String)
 
-    fun process(file: File): List<Chunk> {
-        return when (file.extension.lowercase()) {
-            "pdf" -> processPdf(file)
-            "txt" -> listOf(Chunk(1, null, null, file.readText(Charsets.UTF_8)))
-            "docx" -> listOf(Chunk(null, null, null, extractDocx(file)))
-            "xlsx" -> listOf(Chunk(null, null, null, extractXlsx(file)))
-            "jpg", "jpeg", "png", "bmp", "webp" -> processImage(file)
-            else -> emptyList()
-        }.filter { it.text.isNotBlank() }
+    fun process(file: File): Outcome {
+        val displayName = file.name.substringAfter("__", file.name)
+        return try {
+            val chunks = when (file.extension.lowercase()) {
+                "pdf" -> processPdf(file)
+                "txt" -> listOf(KnowledgeDb.Chunk(1, null, file.readText(Charsets.UTF_8)))
+                "docx" -> listOf(KnowledgeDb.Chunk(null, null, extractDocx(file)))
+                "xlsx" -> listOf(KnowledgeDb.Chunk(null, null, extractXlsx(file)))
+                "jpg", "jpeg", "png", "bmp", "webp" -> processImage(file)
+                else -> emptyList()
+            }.filter { it.text.isNotBlank() }
+
+            if (chunks.isEmpty()) {
+                Outcome(false, "متن قابل‌استفاده‌ای از «$displayName» استخراج نشد.")
+            } else {
+                db.indexDocumentChunks(displayName, chunks)
+                file.delete()
+                Outcome(true, "«$displayName» با موفقیت پردازش و به پایگاه دانش افزوده شد (${chunks.size} بخش).")
+            }
+        } catch (e: Exception) {
+            Outcome(false, "پردازش «$displayName» شکست خورد: ${e.message ?: "خطای ناشناخته"}")
+        }
     }
 
-    private fun processImage(file: File): List<Chunk> {
+    private fun processImage(file: File): List<KnowledgeDb.Chunk> {
         val bitmap = BitmapFactory.decodeFile(file.path) ?: return emptyList()
         val scaled = scaleForOcr(bitmap)
         val text = runOcr(scaled)
         if (scaled !== bitmap) bitmap.recycle()
-        if (text.isBlank()) return emptyList()
-        return listOf(Chunk(null, LegalQueryEngine.articleNumberIn(text)?.toString(), null, text))
+        return if (text.isBlank()) emptyList() else listOf(KnowledgeDb.Chunk(null, null, text))
     }
 
     private fun scaleForOcr(bitmap: Bitmap): Bitmap {
@@ -45,9 +57,9 @@ class DocumentProcessor(private val context: Context) {
         return Bitmap.createScaledBitmap(bitmap, targetWidth, targetHeight, true)
     }
 
-    private fun processPdf(file: File): List<Chunk> {
+    private fun processPdf(file: File): List<KnowledgeDb.Chunk> {
         PDFBoxResourceLoader.init(context)
-        val chunks = ArrayList<Chunk>()
+        val chunks = ArrayList<KnowledgeDb.Chunk>()
         PDDocument.load(file).use { doc ->
             for (pageNo in 1..doc.numberOfPages) {
                 val stripper = PDFTextStripper().apply {
@@ -57,10 +69,10 @@ class DocumentProcessor(private val context: Context) {
                 }
                 val text = runCatching { stripper.getText(doc) }.getOrDefault("")
                 if (isUsablePersianText(text)) {
-                    chunks += Chunk(pageNo, LegalQueryEngine.articleNumberIn(text)?.toString(), null, text)
+                    chunks += KnowledgeDb.Chunk(pageNo, null, text)
                 } else {
                     val ocr = ocrPdfPage(file, pageNo)
-                    if (ocr.isNotBlank()) chunks += Chunk(pageNo, LegalQueryEngine.articleNumberIn(ocr)?.toString(), null, ocr)
+                    if (ocr.isNotBlank()) chunks += KnowledgeDb.Chunk(pageNo, null, ocr)
                 }
             }
         }
@@ -68,7 +80,7 @@ class DocumentProcessor(private val context: Context) {
     }
 
     private fun isUsablePersianText(text: String): Boolean {
-        val n = PersianSearchNormalizer.normalize(text)
+        val n = PersianTextNormalizer.normalize(text)
         if (n.length < 25) return false
         val fa = n.count { it in '\u0600'..'\u06FF' }
         val letters = n.count { it.isLetter() }
@@ -86,7 +98,6 @@ class DocumentProcessor(private val context: Context) {
         page.close()
         renderer.close()
         pfd.close()
-
         val text = runOcr(bitmap)
         bitmap.recycle()
         return text
@@ -99,12 +110,12 @@ class DocumentProcessor(private val context: Context) {
         if (!trained.exists()) context.assets.open("tessdata/fas.traineddata").use { input ->
             FileOutputStream(trained).use { output -> input.copyTo(output) }
         }
-
         val tess = TessBaseAPI()
         return try {
-            if (!tess.init(tessRoot.absolutePath, "fas")) return ""
-            tess.setImage(bitmap)
-            tess.getUTF8Text()?.trim().orEmpty()
+            if (!tess.init(tessRoot.absolutePath, "fas")) "" else {
+                tess.setImage(bitmap)
+                tess.getUTF8Text()?.trim().orEmpty()
+            }
         } finally {
             tess.recycle()
         }
@@ -115,10 +126,9 @@ class DocumentProcessor(private val context: Context) {
             val entry = zip.getEntry("word/document.xml") ?: return ""
             val factory = DocumentBuilderFactory.newInstance().apply { isNamespaceAware = true }
             val doc = factory.newDocumentBuilder().parse(zip.getInputStream(entry))
-            return doc.getElementsByTagNameNS("*", "t").let { nodes ->
-                buildString {
-                    for (i in 0 until nodes.length) append(nodes.item(i).textContent).append(' ')
-                }
+            val nodes = doc.getElementsByTagNameNS("*", "t")
+            return buildString {
+                for (i in 0 until nodes.length) append(nodes.item(i).textContent).append(' ')
             }
         }
     }
